@@ -1,6 +1,7 @@
 package imdb
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/go-pg/pg/v10"
 	"strings"
@@ -15,13 +16,14 @@ func UpdateRatings(db *pg.DB, ratingsTable string) error {
 	// skip header row
 	reader = reader[1:][:]
 
-	var str string
+	var builder bytes.Buffer
 	for _, row := range reader {
 		for _, value := range row {
-			str += value
-			str += "\n"
+			builder.WriteString(value)
+			builder.WriteString("\n")
 		}
 	}
+	str := builder.String()
 	str = strings.ReplaceAll(str, "\t", ",")
 	r := strings.NewReader(str)
 
@@ -30,22 +32,17 @@ func UpdateRatings(db *pg.DB, ratingsTable string) error {
 		return err
 	}
 
-	queryToCreateTempTable := fmt.Sprintf(`
+	_, err = tx.Exec(`
 		CREATE TEMPORARY TABLE temp(
 		    imdb_id varchar(50) not null unique primary key,
 			rating varchar(50) not null,
 			voted varchar(50) not null)
-		    ON COMMIT DROP
-		    `)
-
-	_, err = tx.Exec(queryToCreateTempTable)
+		    ON COMMIT DROP`)
 	if err != nil {
 		return handleInternal(tx, err)
 	}
 
-	queryToCopyDataToTemp := fmt.Sprintf("COPY temp FROM STDIN WITH CSV")
-
-	_, err = tx.CopyFrom(r, queryToCopyDataToTemp)
+	_, err = tx.CopyFrom(r, "COPY temp FROM STDIN WITH CSV")
 	if err != nil {
 		return handleInternal(tx, err)
 	}
