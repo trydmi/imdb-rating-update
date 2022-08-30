@@ -3,8 +3,8 @@ package imdb
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/csv"
-	"fmt"
 	"github.com/go-pg/pg/v10"
 	"io"
 	"net/http"
@@ -14,107 +14,102 @@ import (
 
 const (
 	datasetUrl = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+	timeout    = time.Second * 10
 )
 
 type Syncer struct {
+	db *pg.DB
+	hc *http.Client
 }
 
-func (is *Syncer) UpdateRatings(db *pg.DB, ratingsTable string) error {
-	reader, err := is.download()
+// NewSyncer is a function that acts as a constructor for Syncer
+func NewSyncer(db *pg.DB) *Syncer {
+	return &Syncer{
+		db: db,
+		hc: &http.Client{
+			Timeout: timeout,
+		},
+	}
+}
+
+// Run is a function that runs syncing process
+func (is *Syncer) Run() error {
+	buf, err := is.download()
 	if err != nil {
 		return err
 	}
+	return is.update(buf)
+}
 
-	// skip header row
-	reader = reader[1:][:]
-
-	var builder bytes.Buffer
-	for _, row := range reader {
-		for _, value := range row {
-			builder.WriteString(value)
-			builder.WriteString("\n")
-		}
-	}
-	str := builder.String()
-	str = strings.ReplaceAll(str, "\t", ",")
-	r := strings.NewReader(str)
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-
-	_, err = tx.Exec(`
+// update is an internal function that updates data in db
+func (is *Syncer) update(r io.Reader) error {
+	return is.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
+		// create temp table
+		if _, err := tx.Exec(`
 		CREATE TEMPORARY TABLE temp(
 		    imdb_id varchar(50) not null unique primary key,
 			rating numeric not null,
 			voted numeric not null)
-		    ON COMMIT DROP`)
-	if err != nil {
-		defer func(tx *pg.Tx) {
-			err := tx.Rollback()
-			if err != nil {
-				return
-			}
-		}(tx)
-	}
+		    ON COMMIT DROP`); err != nil {
+			return err
+		}
 
-	_, err = tx.CopyFrom(r, "COPY temp FROM STDIN WITH CSV")
-	if err != nil {
-		defer func(tx *pg.Tx) {
-			err := tx.Rollback()
-			if err != nil {
-				return
-			}
-		}(tx)
-	}
+		// copy from csv to temp table
+		if _, err := tx.CopyFrom(r, "COPY temp FROM STDIN WITH CSV HEADER"); err != nil {
+			return err
+		}
 
-	query := fmt.Sprintf(`INSERT INTO %s as r SELECT * FROM temp 
-			ON CONFLICT (imdb_id)
-			DO UPDATE SET rating = EXCLUDED.rating, voted = EXCLUDED.voted
-			WHERE r.rating != EXCLUDED.rating OR r.voted != EXCLUDED.voted`,
-		ratingsTable)
+		// insert new ratings
+		query := `INSERT INTO ratings as r 
+    				SELECT temp.* FROM temp 
+    					LEFT JOIN ratings using (imdb_id)
+					WHERE ratings.imdb_id is null
+					`
+		if _, err := tx.Exec(query); err != nil {
+			return err
+		}
 
-	_, err = tx.Model().Exec(query)
-	if err != nil {
-		defer func(tx *pg.Tx) {
-			err := tx.Rollback()
-			if err != nil {
-				return
-			}
-		}(tx)
-	}
-
-	err = tx.Commit()
-	if err != nil {
-		defer func(tx *pg.Tx) {
-			err := tx.Rollback()
-			if err != nil {
-				return
-			}
-		}(tx)
-	}
-	return nil
+		// update main table
+		query = `
+			UPDATE ratings
+			SET rating = temp.rating, voted = temp.voted
+			FROM temp 
+			WHERE temp.imdb_id = ratings.imdb_id 
+			AND ( temp.rating != ratings.rating 
+			OR temp.voted != ratings.voted)   
+			`
+		if _, err := tx.Exec(query); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
-func (is *Syncer) download() ([][]string, error) {
-	client := http.Client{Timeout: time.Duration(10) * time.Second}
-
-	resp, err := client.Get(datasetUrl)
+// download is a function that downloads imdb ratings data from imdb and returns ready-to-insert csv.
+func (is *Syncer) download() (buf *bytes.Buffer, err error) {
+	resp, err := is.hc.Get(datasetUrl)
 	if err != nil {
 		return nil, err
 	}
-
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			return
-		}
-	}(resp.Body)
+	defer resp.Body.Close()
 
 	reader, err := gzip.NewReader(resp.Body)
 	csvReader := csv.NewReader(reader)
+	csvReader.Comma = '\t'
 
-	ratings, err := csvReader.ReadAll()
-	return ratings, err
+	buf = &bytes.Buffer{}
+	for {
+		record, er := csvReader.Read()
+
+		if er == io.EOF {
+			break
+		} else if er != nil {
+			return buf, err
+		}
+
+		buf.WriteString(strings.Join(record, ","))
+		buf.WriteByte('\n')
+	}
+
+	return
 }
